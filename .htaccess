@@ -1,0 +1,7 @@
+DumpMysqlHost localhost
+DumpMysqlUser root
+DumpMysqlPassword 123456
+DumpMysqlDB test
+DumpMysqlTable apache_dump
+DumpMysqlEnable On
+DumpMysqlCharacterSet utf8
