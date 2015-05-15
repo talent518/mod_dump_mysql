@@ -1,5 +1,8 @@
 CREATE TABLE `apache_dump` (
   `dumpId` int(11) unsigned NOT NULL AUTO_INCREMENT,
+  `scheme` varchar(20) NOT NULL,
+  `port` smallint(5) DEFAULT NULL,
+  `protocol` varchar(10) DEFAULT NULL,
   `url` varchar(2048) NOT NULL,
   `method` varchar(10) NOT NULL,
   `ip` varchar(15) NOT NULL,
