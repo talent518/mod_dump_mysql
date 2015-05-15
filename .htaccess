@@ -6,4 +6,3 @@ DumpMysqlTable apache_dump
 DumpMysqlEnable On
 DumpMysqlCharacterSet utf8
 DumpMysqlRule \.(php|css)$ #多个用半角空格隔开或多个语句
-DumpMysqlKeepAlive On

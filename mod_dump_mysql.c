@@ -326,7 +326,7 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 		return;
 	}
 
-	apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, postText=?, postTextLength=%d, ip=?, file=?, runTime=%d/1000, dateline=UNIX_TIMESTAMP(), createTime=NOW()", m->mysqltable, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, m->postTextLength, (apr_time_now() - r->request_time));
+	apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET scheme='%s', port=%d, protocol='%s', url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, postText=?, postTextLength=%d, ip=?, file=?, runTime=%d/1000, dateline=UNIX_TIMESTAMP(), createTime=NOW()", m->mysqltable, ap_http_scheme(r), r->server->addrs->host_port, r->protocol, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, m->postTextLength, (apr_time_now() - r->request_time));
 
 	if (mysql_stmt_prepare(stmt, query, strlen(query)))
 	{
@@ -430,6 +430,10 @@ static int dump_mysql_input_filter (ap_filter_t *f, apr_bucket_brigade *bb, ap_i
 	request_rec *r = f->r;
 	dump_mysql_config_rec *sec = (dump_mysql_config_rec *)ap_get_module_config (r->per_dir_config, &dump_mysql_module);
 
+	if (mode != AP_MODE_READBYTES) {
+		return ap_get_brigade(f->next, bb, mode, block, readbytes);
+	}
+
 	if (r->method_number == M_POST && r->method[0] == 'P' && sec->postText == NULL)
 	{
 		if (ap_get_brigade(f->next, bb, mode, block, readbytes)==APR_SUCCESS && apr_brigade_length(bb, 0, &sec->postTextLength ) == APR_SUCCESS)
@@ -441,7 +445,7 @@ static int dump_mysql_input_filter (ap_filter_t *f, apr_bucket_brigade *bb, ap_i
 
 	ap_remove_input_filter(f);
 
-	return ap_pass_brigade(f->next, bb);
+	return APR_SUCCESS;
 }
 
 /*
@@ -488,7 +492,7 @@ static int dump_mysql_output_filter (ap_filter_t *f,apr_bucket_brigade *bb)
 
 static void dump_mysql_register_hooks(apr_pool_t *p)
 {
-	ap_hook_insert_filter(dump_mysql_insert_filter, NULL, NULL, APR_HOOK_LAST);
+	ap_hook_insert_filter(dump_mysql_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 	ap_register_input_filter(dump_mysql_filter_name, dump_mysql_input_filter, NULL, AP_FTYPE_RESOURCE);
 	ap_register_output_filter(dump_mysql_filter_name, dump_mysql_output_filter, NULL, AP_FTYPE_RESOURCE);
 }
