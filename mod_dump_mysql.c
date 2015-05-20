@@ -19,11 +19,19 @@
 
 #include <mysql.h>
 
+#ifndef BOOL
+#define BOOL int
+#endif
+
 #ifndef TRUE
 #define TRUE 1
 #endif
 #ifndef FALSE
 #define FALSE 0
+#endif
+
+#ifndef MIN
+#define MIN(a,b) (((a)<(b))?(a):(b))
 #endif
 
 #define APR_ARRAY_FOREACH_INIT() apr_table_entry_t *apr_foreach_elts;int apr_foreach_i;char *key,*val
@@ -69,6 +77,14 @@ typedef struct
 	char *postText;				/* post submit data */
 	int postTextLength;			/* post submit data length */
 	char *mysqlCharacterSet;	/* Mysql character set to use */
+	int maxAllowedPacket;		/* Mysql client data packet max size from mysql server read */
+	int insertId;				/* insert after dumpId for value */
+	BOOL isFirstPostBucketRead; /* is first post bucket read */
+	int post_readed_length;
+	int response_readed_length;
+	apr_time_t mysql_current_time;
+	apr_time_t mysql_execute_time;
+	BOOL isFirstResponseBucketRead; /* is first response bucket read */
 	apr_array_header_t *rules;	/* dump rule array */
 	mysql_connection mysql;
 } dump_mysql_config_rec;
@@ -81,6 +97,11 @@ typedef struct
 	char *pattern;
 	ap_regex_t *regexp;
 } rule_entry;
+
+typedef struct
+{
+	apr_bucket_brigade *bb;
+} input_context;
 
 static const char dump_mysql_filter_name[] = "dump_mysql";
 
@@ -105,12 +126,13 @@ static apr_status_t mod_auth_mysql_cleanup (void *data)
  * is good, FALSE if not able to connect.  If false returned, reason
  * for failure has been logged to error_log file already.
  */
-static int open_db_handle(request_rec *r, dump_mysql_config_rec *m)
+static BOOL open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 {
 	static MYSQL mysql_conn;
 	char query[MAX_STRING_LEN];
-	short host_match = FALSE;
-	short user_match = FALSE;
+	MYSQL_RES *result;
+	MYSQL_ROW *row;
+	MYSQL_FIELD *field;
 
 	if (m->mysql.handle)
 	{
@@ -118,7 +140,11 @@ static int open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 		if (mysql_ping(m->mysql.handle))
 		{
 			ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "Mysql ERROR: %s", mysql_error(m->mysql.handle));
+
+			return FALSE;
 		}
+
+		return TRUE;
 	}
 
 	m->mysql.handle = mysql_init(&mysql_conn);
@@ -162,12 +188,39 @@ static int open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 	if (m->mysqlCharacterSet)   /* If a character set was specified */
 	{
 		apr_snprintf(query, sizeof(query)-1, "SET NAMES %s", m->mysqlCharacterSet);
-		if (mysql_query(m->mysql.handle, query) != 0)
+		if (mysql_query(m->mysql.handle, query))
 		{
 			ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "Mysql ERROR: %s: %s", mysql_error(m->mysql.handle), r->unparsed_uri);
 			return FALSE;
 		}
 	}
+
+	if(mysql_query(m->mysql.handle, "SHOW GLOBAL VARIABLES LIKE 'max_allowed_packet'"))
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_WARNING, 0, r, "Mysql ERROR: %s: %s", mysql_error(m->mysql.handle), r->unparsed_uri);
+
+		m->maxAllowedPacket = 1*1024*1024;
+
+		return TRUE;
+	}
+
+	result = mysql_use_result(m->mysql.handle);
+
+	row=mysql_fetch_row(result);
+	field = mysql_fetch_field_direct(result, 1);
+
+	if(row && field && strcmp(field->name,"Value")==0)
+	{
+		m->maxAllowedPacket = atoi(row[1]);
+	}
+	else
+	{
+		m->maxAllowedPacket = 1*1024*1024;
+	}
+
+	m->maxAllowedPacket -= 1024;
+
+	mysql_free_result(result);
 
 	return TRUE;
 }
@@ -189,7 +242,15 @@ static void *create_dump_mysql_dir_config (apr_pool_t *p, char *d)
 	m->mysqlCharacterSet = "utf8";   /* default characterset to use */
 	m->postText = NULL;
 	m->postTextLength = 0;
+	m->insertId = 0;
 	m->rules = apr_array_make(p, 20, sizeof(rule_entry));
+	m->maxAllowedPacket = 0;
+	m->isFirstPostBucketRead = TRUE;
+	m->isFirstResponseBucketRead = TRUE;
+	m->post_readed_length = 0;
+	m->response_readed_length = 0;
+	m->mysql_current_time=0;
+	m->mysql_execute_time=0;
 
 	return (void *)m;
 }
@@ -239,15 +300,10 @@ static command_rec dump_mysql_cmds[] =
 
 module AP_MODULE_DECLARE_DATA dump_mysql_module;
 
-/*
- * Fetch and return password string from database for named user.
- * If we are in NoPasswd mode, returns user name instead.
- * If user or password not found, returns NULL
- */
-static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *responseText, unsigned long responseTextLength)
+static void dump_mysql_record_full_and_response(request_rec *r, dump_mysql_config_rec *m, char *responseText, unsigned long responseTextLength)
 {
 	MYSQL_STMT   *stmt;
-	MYSQL_BIND   binds[8];
+	MYSQL_BIND   binds[7];
 	char query[MAX_STRING_LEN];
 	const apr_array_header_t *arr;
 	char *requestHeader, *responseHeader, *ptr, *client_ip;
@@ -314,11 +370,6 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 		client_ip_len = strlen(client_ip);
 	}
 
-	if (!open_db_handle(r,m))
-	{
-		return;  /* failure reason already logged */
-	}
-
 	stmt = mysql_stmt_init(m->mysql.handle);
 	if (!stmt)
 	{
@@ -326,7 +377,12 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 		return;
 	}
 
-	apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET scheme='%s', port=%d, protocol='%s', url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, postText=?, postTextLength=%d, ip=?, file=?, runTime=%d/1000, dateline=UNIX_TIMESTAMP(), createTime=NOW()", m->mysqltable, ap_http_scheme(r), r->server->addrs->host_port, r->protocol, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, m->postTextLength, (apr_time_now() - r->request_time));
+	if(m->insertId == 0)
+		apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET scheme='%s', port=%d, protocol='%s', url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, ip=?, file=?, runTime=%d/1000,       dateline=UNIX_TIMESTAMP(), createTime=NOW()                ", m->mysqltable, ap_http_scheme(r), r->server->addrs->host_port, r->protocol, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, (m->mysql_current_time - m->mysql_execute_time - r->request_time));
+	else
+		apr_snprintf(query,sizeof(query)-1,"     UPDATE %s SET scheme='%s', port=%d, protocol='%s', url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, ip=?, file=?, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, ap_http_scheme(r), r->server->addrs->host_port, r->protocol, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
+
+	ap_log_rerror (APLOG_MARK, APLOG_WARNING, 0, r, "dump_mysql_record_full_and_response(%d): [%c] %s", responseTextLength, responseText, query);
 
 	if (mysql_stmt_prepare(stmt, query, strlen(query)))
 	{
@@ -369,23 +425,17 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 	binds[4].length= &responseTextLength;
 
 	binds[5].buffer_type= MYSQL_TYPE_STRING;
-	binds[5].buffer= m->postText;
-	binds[5].buffer_length= m->postTextLength;
+	binds[5].buffer= client_ip;
+	binds[5].buffer_length= client_ip_len;
 	binds[5].is_null= 0;
-	binds[5].length= &m->postTextLength;
-
-	binds[6].buffer_type= MYSQL_TYPE_STRING;
-	binds[6].buffer= client_ip;
-	binds[6].buffer_length= client_ip_len;
-	binds[6].is_null= 0;
-	binds[6].length= &client_ip_len;
+	binds[5].length= &client_ip_len;
 
 	file_len= strlen(r->uri);
-	binds[7].buffer_type= MYSQL_TYPE_STRING;
-	binds[7].buffer= r->uri;
-	binds[7].buffer_length= file_len;
-	binds[7].is_null= 0;
-	binds[7].length= &file_len;
+	binds[6].buffer_type= MYSQL_TYPE_STRING;
+	binds[6].buffer= r->uri;
+	binds[6].buffer_length= file_len;
+	binds[6].is_null= 0;
+	binds[6].length= &file_len;
 
 	if (mysql_stmt_bind_param(stmt, binds))
 	{
@@ -399,6 +449,9 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 		return;
 	}
 
+	if(m->insertId == 0)
+		m->insertId = mysql_stmt_insert_id(stmt);
+
 	if (mysql_stmt_close(stmt))
 	{
 		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_close(stmt): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
@@ -406,10 +459,127 @@ static void insert_dump_mysql(request_rec *r, dump_mysql_config_rec *m, char *re
 	}
 }
 
-/*
- * callback from Apache to do the authentication of the user to his
- * password.
- */
+static void dump_mysql_record_post_or_response(request_rec *r, dump_mysql_config_rec *m, BOOL is_post, char *buffer, unsigned long buffer_length)
+{
+	MYSQL_STMT   *stmt;
+	MYSQL_BIND   binds[1];
+	char query[MAX_STRING_LEN];
+
+	if(buffer_length<=0)
+	{
+		return;
+	}
+
+	stmt = mysql_stmt_init(m->mysql.handle);
+	if (!stmt)
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_init(), out of memory: %s", r->uri);
+		return;
+	}
+
+	if(is_post)
+	{
+		if(m->insertId == 0)
+			apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET postText=?                 , postTextLength=postTextLength+%d, runTime=%d/1000,       dateline=UNIX_TIMESTAMP(), createTime=NOW()                ", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time));
+		else
+			apr_snprintf(query,sizeof(query)-1,"     UPDATE %s SET postText=CONCAT(postText,?), postTextLength=postTextLength+%d, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
+	}
+	else
+	{
+		apr_snprintf(query,sizeof(query)-1,"UPDATE %s SET responseText=CONCAT(responseText,?), responseTextLength=responseTextLength+%d, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
+	}
+
+	ap_log_rerror (APLOG_MARK, APLOG_WARNING, 0, r, "dump_mysql_record_post_or_response(%d): [%c] %s", buffer_length, buffer, query);
+
+	if (mysql_stmt_prepare(stmt, query, strlen(query)))
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_prepare(stmt, query, strlen(query)): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
+		return;
+	}
+
+	memset(binds, 0, sizeof(binds));
+
+	binds[0].buffer_type= MYSQL_TYPE_STRING;
+	binds[0].buffer= buffer;
+	binds[0].buffer_length= buffer_length;
+	binds[0].is_null= 0;
+	binds[0].length= &buffer_length;
+
+	if (mysql_stmt_bind_param(stmt, binds))
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_bind_param(stmt, binds): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
+		return;
+	}
+
+	if (mysql_stmt_execute(stmt))
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_execute(stmt): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
+		return;
+	}
+
+	if(is_post && m->insertId == 0)
+		m->insertId = mysql_stmt_insert_id(stmt);
+
+	if (mysql_stmt_close(stmt))
+	{
+		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_close(stmt): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
+		return;
+	}
+}
+
+static int dump_mysql_record(request_rec *r, dump_mysql_config_rec *sec, BOOL is_post, BOOL *ref_is_first, int *ref_length, char *buffer, apr_size_t len)
+{
+	BOOL is_first=*ref_is_first;
+	int length=*ref_length;
+	int buffer_length;
+
+	sec->mysql_current_time=apr_time_now();
+	if (open_db_handle(r,sec))
+	{
+		buffer_length=MIN(len,sec->maxAllowedPacket);
+		if(is_first)
+		{
+			if(is_post)
+				dump_mysql_record_post_or_response(r, sec, TRUE, buffer, buffer_length);
+			else
+				dump_mysql_record_full_and_response(r, sec, buffer, buffer_length);
+			length = len;
+
+			// set is first bucket read
+			is_first=FALSE;
+			if(is_post)
+			{
+				sec->isFirstPostBucketRead=FALSE;
+			}
+			else
+			{
+				sec->isFirstResponseBucketRead=FALSE;
+			}
+		}
+		else
+		{
+			if(sec->insertId && sec->maxAllowedPacket>length+len)
+			{
+				dump_mysql_record_post_or_response(r, sec, is_post, buffer, buffer_length);
+				length+=len;
+			}
+		}
+
+		// set bucket readed length
+		if(is_post)
+		{
+			sec->post_readed_length=length;
+		}
+		else
+		{
+			sec->response_readed_length=length;
+		}
+	}
+	sec->mysql_execute_time+=(apr_time_now()-sec->mysql_current_time);
+	*ref_is_first=is_first;
+	*ref_length=length;
+}
+
 static void dump_mysql_insert_filter (request_rec *r)
 {
 	dump_mysql_config_rec *sec = (dump_mysql_config_rec *)ap_get_module_config (r->per_dir_config, &dump_mysql_module);
@@ -428,22 +598,57 @@ static void dump_mysql_insert_filter (request_rec *r)
 static int dump_mysql_input_filter (ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes)
 {
 	request_rec *r = f->r;
+	conn_rec *c = r->connection;
 	dump_mysql_config_rec *sec = (dump_mysql_config_rec *)ap_get_module_config (r->per_dir_config, &dump_mysql_module);
 
-	if (mode != AP_MODE_READBYTES) {
-		return ap_get_brigade(f->next, bb, mode, block, readbytes);
-	}
+	apr_bucket *b,*bh;
+	apr_size_t len=0;
 
-	if (r->method_number == M_POST && r->method[0] == 'P' && sec->postText == NULL)
+	input_context *ctx;
+
+	int ret;
+	char *buffer=NULL,*buf;
+	int length,buffer_length;
+	BOOL is_first;
+
+	is_first=sec->isFirstPostBucketRead;
+	length=sec->post_readed_length;
+
+	if(!(ctx=f->ctx))
 	{
-		if (ap_get_brigade(f->next, bb, mode, block, readbytes)==APR_SUCCESS && apr_brigade_length(bb, 0, &sec->postTextLength ) == APR_SUCCESS)
-		{
-			sec->postText = apr_palloc(r->pool, sec->postTextLength + 1);
-			apr_brigade_flatten(bb, sec->postText, (apr_size_t)&sec->postTextLength );
-		}
+		f->ctx = ctx = apr_palloc(r->pool, sizeof(input_context));
+		ctx->bb = apr_brigade_create(r->pool, c->bucket_alloc);
 	}
 
-	ap_remove_input_filter(f);
+	if (APR_BRIGADE_EMPTY(ctx->bb)) {
+		ret = ap_get_brigade(f->next, ctx->bb, mode, block, readbytes);
+
+		if (mode == AP_MODE_EATCRLF || ret != APR_SUCCESS)
+			return ret;
+	}
+
+	while(!APR_BRIGADE_EMPTY(ctx->bb)) {
+		b = APR_BRIGADE_FIRST(ctx->bb);
+
+		if(APR_BUCKET_IS_EOS(b)) {
+			APR_BUCKET_REMOVE(b);
+			APR_BRIGADE_INSERT_TAIL(bb, b);
+			break;
+		}
+
+		ret=apr_bucket_read(b, &buffer, &len, block);
+		if(ret != APR_SUCCESS)
+			return ret;
+
+		dump_mysql_record(r, sec, TRUE, &is_first, &length, buffer, len);
+
+		buf = apr_bucket_alloc(len, c->bucket_alloc);
+		memcpy(buf,buffer,len);
+
+		bh = apr_bucket_heap_create(buf, len, apr_bucket_free, c->bucket_alloc);
+		APR_BRIGADE_INSERT_TAIL(bb, bh);
+		apr_bucket_delete(b);
+	}
 
 	return APR_SUCCESS;
 }
@@ -452,12 +657,11 @@ static int dump_mysql_input_filter (ap_filter_t *f, apr_bucket_brigade *bb, ap_i
  * callback from Apache to do the authentication of the user to his
  * password.
  */
-static int dump_mysql_output_filter (ap_filter_t *f,apr_bucket_brigade *bb)
+static int dump_mysql_output_filter (ap_filter_t *f, apr_bucket_brigade *bb)
 {
 	request_rec *r = f->r;
+	conn_rec *c = r->connection;
 	dump_mysql_config_rec *sec = (dump_mysql_config_rec *)ap_get_module_config (r->per_dir_config, &dump_mysql_module);
-	char *buffer=NULL;
-	size_t len=0;
 
 	rule_entry *rule, *rules = (rule_entry *) sec->rules->elts;
 	int flag = 0, i;
@@ -476,23 +680,52 @@ static int dump_mysql_output_filter (ap_filter_t *f,apr_bucket_brigade *bb)
 
 	if (i==0 || flag )
 	{
-		if (apr_brigade_length(bb, 0, &len) == APR_SUCCESS)
-		{
-			buffer = apr_palloc(r->pool, len + 1);
-			apr_brigade_flatten(bb, buffer, (apr_size_t)&len);
-		}
+		apr_bucket *b,*be,*bh;
+		apr_bucket_brigade *ob;
+		apr_size_t len=0;
 
-		insert_dump_mysql(r, sec, buffer, len ); /* Get a salt if one was specified */
+		int ret;
+		char *buffer=NULL,*buf;
+		int length,buffer_length;
+		BOOL is_first;
+
+		is_first=sec->isFirstResponseBucketRead;
+		length=sec->response_readed_length;
+
+		ob=apr_brigade_create(r->pool, c->bucket_alloc);
+
+		for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
+			if(APR_BUCKET_IS_EOS(b))
+			{
+				apr_bucket *be=apr_bucket_eos_create(c->bucket_alloc);
+				APR_BRIGADE_INSERT_TAIL(ob,be);
+				continue;
+			}
+			ret = apr_bucket_read(b, &buffer, &len, APR_BLOCK_READ);
+			if(ret != APR_SUCCESS)
+				return ret;
+
+			dump_mysql_record(r, sec, FALSE, &is_first, &length, buffer, len);
+
+			buf = apr_bucket_alloc(len, c->bucket_alloc);
+			memcpy(buf,buffer,len);
+
+			bh = apr_bucket_heap_create(buf, len, apr_bucket_free, c->bucket_alloc);
+			APR_BRIGADE_INSERT_TAIL(ob,bh);
+		}
+		apr_brigade_cleanup(bb);
+
+		return ap_pass_brigade(f->next,ob);
 	}
 
 	ap_remove_output_filter(f);
 
-	return ap_pass_brigade(f->next, bb);
+	return ap_pass_brigade(f->next,bb);
 }
 
 static void dump_mysql_register_hooks(apr_pool_t *p)
 {
-	ap_hook_insert_filter(dump_mysql_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_insert_filter(dump_mysql_insert_filter, NULL, NULL, APR_HOOK_LAST);
 	ap_register_input_filter(dump_mysql_filter_name, dump_mysql_input_filter, NULL, AP_FTYPE_RESOURCE);
 	ap_register_output_filter(dump_mysql_filter_name, dump_mysql_output_filter, NULL, AP_FTYPE_RESOURCE);
 }
