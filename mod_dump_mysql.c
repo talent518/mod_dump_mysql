@@ -1,6 +1,3 @@
-#define STRING(x) STR(x) /* Used to build strings from compile options */
-#define STR(x) #x
-
 #include "ap_mmn.h" /* For MODULE_MAGIC_NUMBER */
 
 #include "httpd.h"
@@ -105,14 +102,7 @@ typedef struct
 
 static const char dump_mysql_filter_name[] = "dump_mysql";
 
-/*
- * Global handle to db.  If not null, assume it is still valid.
- * Mysql in recent incarnations will re-connect automatically if the
- * connection is closed, so we don't worry about that here.
- */
-/* static MYSQL *mysql_handle = NULL; */
-
-static apr_status_t mod_auth_mysql_cleanup (void *data)
+static apr_status_t dump_mysql_db_cleanup (void *data)
 {
 	dump_mysql_config_rec *m = data;
 	if (m->mysql.handle)
@@ -121,11 +111,6 @@ static apr_status_t mod_auth_mysql_cleanup (void *data)
 	return 0;
 }
 
-/*
- * open connection to DB server if necessary.  Return TRUE if connection
- * is good, FALSE if not able to connect.  If false returned, reason
- * for failure has been logged to error_log file already.
- */
 static BOOL open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 {
 	static MYSQL mysql_conn;
@@ -169,7 +154,7 @@ static BOOL open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 		return FALSE;
 	}
 
-	apr_pool_cleanup_register(r->pool, (void *)m, mod_auth_mysql_cleanup, apr_pool_cleanup_null);
+	apr_pool_cleanup_register(r->pool, (void *)m, dump_mysql_db_cleanup, apr_pool_cleanup_null);
 
 	if (m->mysqluser)
 		strcpy(m->mysql.user, m->mysqluser);
@@ -238,7 +223,7 @@ static void *create_dump_mysql_dir_config (apr_pool_t *p, char *d)
 	m->mysqlpasswd = "";
 	m->mysqlDB = "test";
 	m->mysqltable = "apache_dump";
-	m->mysqlEnable = FALSE;     /* authorization on by default */
+	m->mysqlEnable = FALSE;     /* not enable on by default */
 	m->mysqlCharacterSet = "utf8";   /* default characterset to use */
 	m->postText = NULL;
 	m->postTextLength = 0;
@@ -289,7 +274,7 @@ static command_rec dump_mysql_cmds[] =
 
 	AP_INIT_TAKE1("DumpMysqlTable", ap_set_string_slot, (void *) APR_OFFSETOF(dump_mysql_config_rec, mysqltable), OR_FILEINFO, "mysql user table name"),
 
-	AP_INIT_FLAG("DumpMysqlEnable", ap_set_flag_slot, (void *) APR_OFFSETOF(dump_mysql_config_rec, mysqlEnable), OR_FILEINFO, "enable mysql authorization"),
+	AP_INIT_FLAG("DumpMysqlEnable", ap_set_flag_slot, (void *) APR_OFFSETOF(dump_mysql_config_rec, mysqlEnable), OR_FILEINFO, "enable mysql dump filter"),
 
 	AP_INIT_TAKE1("DumpMysqlCharacterSet", ap_set_string_slot, (void *) APR_OFFSETOF(dump_mysql_config_rec, mysqlCharacterSet), OR_FILEINFO, "mysql character set to be used"),
 
