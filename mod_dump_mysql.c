@@ -465,9 +465,9 @@ static void dump_mysql_record_post_or_response(request_rec *r, dump_mysql_config
 	if(is_post)
 	{
 		if(m->insertId == 0)
-			apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET postText=?                 , postTextLength=postTextLength+%d, runTime=%d/1000,       dateline=UNIX_TIMESTAMP(), createTime=NOW()                ", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time));
+			apr_snprintf(query,sizeof(query)-1,"INSERT INTO %s SET postText=?, postTextLength=%d, runTime=%d/1000, dateline=UNIX_TIMESTAMP(), createTime=NOW()", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time));
 		else
-			apr_snprintf(query,sizeof(query)-1,"     UPDATE %s SET postText=CONCAT(postText,?), postTextLength=postTextLength+%d, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
+			apr_snprintf(query,sizeof(query)-1,"UPDATE %s SET postText=CONCAT(postText,?), postTextLength=postTextLength+%d, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
 	}
 	else
 	{
