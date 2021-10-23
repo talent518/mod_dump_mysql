@@ -367,8 +367,6 @@ static void dump_mysql_record_full_and_response(request_rec *r, dump_mysql_confi
 	else
 		apr_snprintf(query,sizeof(query)-1,"     UPDATE %s SET scheme='%s', port=%d, protocol='%s', url=?, method=?, requestDateline=%d, requestTime=FROM_UNIXTIME(%d), responseCode=%d, requestHeader=?, requestHeaderLength=%d, responseHeader=?, responseHeaderLength=%d, responseText=?, responseTextLength=%d, ip=?, file=?, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, ap_http_scheme(r), r->server->addrs->host_port, r->protocol, requestDateline, requestDateline, r->status, requestHeaderLength, responseHeaderLength, responseTextLength, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
 
-	ap_log_rerror (APLOG_MARK, APLOG_WARNING, 0, r, "dump_mysql_record_full_and_response(%d): [%c] %s", responseTextLength, responseText, query);
-
 	if (mysql_stmt_prepare(stmt, query, strlen(query)))
 	{
 		ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "mysql_stmt_prepare(stmt, query, strlen(query)): %s: %s: %s", mysql_stmt_error(stmt), query, r->uri);
@@ -473,8 +471,6 @@ static void dump_mysql_record_post_or_response(request_rec *r, dump_mysql_config
 	{
 		apr_snprintf(query,sizeof(query)-1,"UPDATE %s SET responseText=CONCAT(responseText,?), responseTextLength=responseTextLength+%d, runTime=%d/1000, updateDateline=UNIX_TIMESTAMP(), updateTime=NOW() WHERE dumpId=%d", m->mysqltable, buffer_length, (m->mysql_current_time - m->mysql_execute_time - r->request_time), m->insertId);
 	}
-
-	ap_log_rerror (APLOG_MARK, APLOG_WARNING, 0, r, "dump_mysql_record_post_or_response(%d): [%c] %s", buffer_length, buffer, query);
 
 	if (mysql_stmt_prepare(stmt, query, strlen(query)))
 	{
