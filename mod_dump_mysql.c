@@ -126,10 +126,8 @@ static BOOL open_db_handle(request_rec *r, dump_mysql_config_rec *m)
 		{
 			ap_log_rerror (APLOG_MARK, APLOG_ERR, 0, r, "Mysql ERROR: %s", mysql_error(m->mysql.handle));
 
-			return FALSE;
+			mysql_close(m->mysql.handle);
 		}
-
-		return TRUE;
 	}
 
 	m->mysql.handle = mysql_init(&mysql_conn);
